@@ -1,0 +1,4 @@
+[
+  { "address": "PUT_WALLET_ADDRESS_HERE", "label": "Friend A" },
+  { "address": "PUT_ANOTHER_WALLET_ADDRESS_HERE", "label": "Trader B" }
+]
