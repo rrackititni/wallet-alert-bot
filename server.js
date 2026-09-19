@@ -93,6 +93,90 @@ async function getRugCheckSummary(mint) {
   }
 }
 
+// Simple in-memory cache so we don't re-query a deployer's full history on
+// every single buy — same deployer often launches multiple tokens you'll see.
+const deployerCache = new Map(); // wallet -> { data, expiresAt }
+const DEPLOYER_CACHE_TTL_MS = 30 * 60 * 1000; // 30 minutes
+
+const HELIUS_API_KEY = process.env.HELIUS_API_KEY || "";
+
+// Full RugCheck report includes the creator wallet, which the lighter
+// /summary endpoint used above omits.
+async function getTokenCreator(mint) {
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 5000);
+    const res = await fetch(`https://api.rugcheck.xyz/v1/tokens/${mint}/report`, {
+      signal: controller.signal,
+    });
+    clearTimeout(timeout);
+    if (!res.ok) return null;
+    const data = await res.json();
+    return data.creator || data.creatorAddress || null;
+  } catch (err) {
+    return null;
+  }
+}
+
+// Look up how many tokens a deployer wallet has launched, and how many of
+// those RugCheck flags as rugged. This is a best-effort v1: Helius's exact
+// transaction shape for pump.fun launches can vary, so treat "tokensFound: 0"
+// as "couldn't confirm" rather than "this deployer has never launched anything."
+async function getDeployerReputation(creatorWallet) {
+  if (!HELIUS_API_KEY || !creatorWallet) return null;
+
+  const cached = deployerCache.get(creatorWallet);
+  if (cached && cached.expiresAt > Date.now()) return cached.data;
+
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 8000);
+    const res = await fetch(
+      `https://api.helius.xyz/v0/addresses/${creatorWallet}/transactions?api-key=${HELIUS_API_KEY}&type=CREATE&limit=20`,
+      { signal: controller.signal }
+    );
+    clearTimeout(timeout);
+    if (!res.ok) return null;
+
+    const txs = await res.json();
+    if (!Array.isArray(txs)) return null;
+
+    // Pull out mint addresses this wallet appears to have created.
+    // Helius's CREATE-type payloads vary by program; we check the common
+    // places a new mint address shows up.
+    const mints = new Set();
+    for (const tx of txs) {
+      const transfers = tx.tokenTransfers || [];
+      for (const t of transfers) {
+        if (t.mint) mints.add(t.mint);
+      }
+    }
+
+    const mintList = Array.from(mints).slice(0, 8); // cap RugCheck calls per lookup
+    let ruggedCount = 0;
+    let checkedCount = 0;
+
+    for (const mint of mintList) {
+      const summary = await getRugCheckSummary(mint);
+      if (summary) {
+        checkedCount++;
+        if (summary.score >= 60) ruggedCount++;
+      }
+    }
+
+    const data = {
+      tokensFound: mintList.length,
+      checkedCount,
+      ruggedCount,
+    };
+
+    deployerCache.set(creatorWallet, { data, expiresAt: Date.now() + DEPLOYER_CACHE_TTL_MS });
+    return data;
+  } catch (err) {
+    return null;
+  }
+}
+
 app.post("/helius-webhook", async (req, res) => {
   // Optional shared-secret check. Helius sends this back as the Authorization
   // header if you set it when creating the webhook.
@@ -156,6 +240,15 @@ async function handleTransaction(tx) {
   // Only risk-check on BUYs — that's the moment you'd actually consider following in
   const rugCheck = action === "BUY" && tokenMint ? await getRugCheckSummary(tokenMint) : null;
 
+  // Deployer reputation: who made this token, and have their other launches been rugs?
+  let deployerRep = null;
+  if (action === "BUY" && tokenMint && HELIUS_API_KEY) {
+    const creator = await getTokenCreator(tokenMint);
+    if (creator) {
+      deployerRep = await getDeployerReputation(creator);
+    }
+  }
+
   const embed = {
     title: `${action}: ${label}`,
     color,
@@ -177,6 +270,18 @@ async function handleTransaction(tx) {
           ]
         : action === "BUY"
         ? [{ name: "Risk Check (RugCheck)", value: "Unavailable (token too new or API error)", inline: false }]
+        : []),
+      ...(deployerRep
+        ? [
+            {
+              name: "Deployer History",
+              value:
+                deployerRep.tokensFound === 0
+                  ? "No prior launches found (or couldn't confirm)"
+                  : `${deployerRep.tokensFound} token(s) found, ${deployerRep.ruggedCount} flagged high-risk by RugCheck`,
+              inline: false,
+            },
+          ]
         : []),
     ],
     description: [
