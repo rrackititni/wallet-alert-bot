@@ -58,6 +58,41 @@ function alreadySeen(sig) {
   return false;
 }
 
+// Query RugCheck's free public API for a token's risk profile.
+// No API key required. Returns null on any failure so a BUY alert still
+// posts even if RugCheck is slow, down, or hasn't indexed a brand-new token.
+async function getRugCheckSummary(mint) {
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 5000); // don't hang the alert on a slow API
+    const res = await fetch(
+      `https://api.rugcheck.xyz/v1/tokens/${mint}/report/summary`,
+      { signal: controller.signal }
+    );
+    clearTimeout(timeout);
+    if (!res.ok) return null;
+    const data = await res.json();
+
+    const score = data.score_normalised ?? data.score ?? null;
+    if (score === null) return null;
+
+    let verdict = "✅ Low risk";
+    if (score >= 60) verdict = "🚨 High risk";
+    else if (score >= 30) verdict = "⚠️ Medium risk";
+
+    // Take the top 2 highest-severity risk flags, if any, to keep the alert short
+    const risks = Array.isArray(data.risks) ? data.risks : [];
+    const topRisks = risks
+      .slice(0, 2)
+      .map((r) => r.name || r.description)
+      .filter(Boolean);
+
+    return { score, verdict, topRisks };
+  } catch (err) {
+    return null; // timeout, network error, or bad JSON — fail silently, alert still posts
+  }
+}
+
 app.post("/helius-webhook", async (req, res) => {
   // Optional shared-secret check. Helius sends this back as the Authorization
   // header if you set it when creating the webhook.
@@ -118,6 +153,9 @@ async function handleTransaction(tx) {
 
   const color = action === "BUY" ? 0x2ecc71 : action === "SELL" ? 0xe74c3c : 0x95a5a6;
 
+  // Only risk-check on BUYs — that's the moment you'd actually consider following in
+  const rugCheck = action === "BUY" && tokenMint ? await getRugCheckSummary(tokenMint) : null;
+
   const embed = {
     title: `${action}: ${label}`,
     color,
@@ -126,6 +164,20 @@ async function handleTransaction(tx) {
       { name: "Type", value: type, inline: true },
       ...(tokenMint ? [{ name: "Token (mint)", value: `\`${tokenMint}\``, inline: false }] : []),
       ...(tokenAmount ? [{ name: "Amount", value: String(tokenAmount), inline: true }] : []),
+      ...(rugCheck
+        ? [
+            {
+              name: "Risk Check (RugCheck)",
+              value: [
+                `${rugCheck.verdict} (score: ${rugCheck.score})`,
+                ...(rugCheck.topRisks.length ? rugCheck.topRisks.map((r) => `• ${r}`) : []),
+              ].join("\n"),
+              inline: false,
+            },
+          ]
+        : action === "BUY"
+        ? [{ name: "Risk Check (RugCheck)", value: "Unavailable (token too new or API error)", inline: false }]
+        : []),
     ],
     description: [
       `[View Transaction](${solscanTx})`,
