@@ -10,6 +10,8 @@
     "start": "node server.js"
   },
   "dependencies": {
-    "express": "^4.19.2"
+    "express": "^4.19.2",
+    "@solana/web3.js": "^1.95.3",
+    "bs58": "^5.0.0"
   }
 }
