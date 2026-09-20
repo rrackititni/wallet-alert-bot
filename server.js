@@ -5,9 +5,13 @@
 const express = require("express");
 const fs = require("fs");
 const path = require("path");
+const crypto = require("crypto");
+const { Connection, Keypair, VersionedTransaction, PublicKey } = require("@solana/web3.js");
+const bs58 = require("bs58");
 
 const app = express();
 app.use(express.json({ limit: "5mb" }));
+app.use(express.urlencoded({ extended: true }));
 
 const PORT = process.env.PORT || 3000;
 const HELIUS_WEBHOOK_SECRET = process.env.HELIUS_WEBHOOK_SECRET || "";
@@ -16,6 +20,49 @@ const DISCORD_WEBHOOK_URL = process.env.DISCORD_WEBHOOK_URL;
 if (!DISCORD_WEBHOOK_URL) {
   console.error("Missing DISCORD_WEBHOOK_URL environment variable. Exiting.");
   process.exit(1);
+}
+
+// ===== Trading configuration =====
+// TRADING_ENABLED is a kill switch: set to "false" in Railway to instantly
+// stop all execution without touching code or redeploying.
+const TRADING_ENABLED = (process.env.TRADING_ENABLED || "false").toLowerCase() === "true";
+const TRADING_WALLET_PRIVATE_KEY = process.env.TRADING_WALLET_PRIVATE_KEY || "";
+const TRADE_AMOUNT_SOL = parseFloat(process.env.TRADE_AMOUNT_SOL || "0.05");
+// Hard daily cap enforced in code, independent of what any single trade requests.
+// This is the real backstop on the "$50 total" budget — resets at midnight UTC.
+const MAX_DAILY_SOL = parseFloat(process.env.MAX_DAILY_SOL || "0.3");
+const HELIUS_API_KEY_FOR_RPC = process.env.HELIUS_API_KEY || "";
+const RPC_URL = HELIUS_API_KEY_FOR_RPC
+  ? `https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY_FOR_RPC}`
+  : "https://api.mainnet-beta.solana.com";
+
+const connection = new Connection(RPC_URL, "confirmed");
+let tradingKeypair = null;
+if (TRADING_WALLET_PRIVATE_KEY) {
+  try {
+    tradingKeypair = Keypair.fromSecretKey(bs58.decode(TRADING_WALLET_PRIVATE_KEY));
+  } catch (err) {
+    console.error("TRADING_WALLET_PRIVATE_KEY is set but invalid — trading disabled.", err.message);
+  }
+}
+
+// Pending trades awaiting your confirmation click. In-memory only — if the
+// server restarts, unconfirmed links go dead (safer than surviving a restart
+// with stale state).
+const pendingTrades = new Map(); // id -> { mint, label, expiresAt, used }
+const PENDING_TRADE_TTL_MS = 15 * 60 * 1000; // 15 min — memecoin prices move fast
+
+// Tracks SOL spent today toward MAX_DAILY_SOL. Resets when the date rolls over.
+// In-memory, so a restart also resets it — acceptable for a $50-scale v1, but
+// know this isn't a durable ledger.
+let dailySpentSol = 0;
+let dailySpentDate = new Date().toISOString().slice(0, 10);
+function checkAndResetDaily() {
+  const today = new Date().toISOString().slice(0, 10);
+  if (today !== dailySpentDate) {
+    dailySpentDate = today;
+    dailySpentSol = 0;
+  }
 }
 
 // Load tracked wallets from wallets.json: [{ "address": "...", "label": "Friend A" }, ...]
@@ -235,6 +282,23 @@ async function handleTransaction(tx) {
   const solscanToken = tokenMint ? `https://solscan.io/token/${tokenMint}` : null;
   const axiomLink = tokenMint ? `https://axiom.trade/meme/${tokenMint}` : null;
 
+  // Create a semi-auto trade confirmation link for BUYs and SELLs — clicking
+  // it takes you to a page where YOU tap confirm; nothing executes here.
+  let confirmUrl = null;
+  if ((action === "BUY" || action === "SELL") && tokenMint) {
+    const id = crypto.randomUUID();
+    pendingTrades.set(id, {
+      id,
+      type: action, // "BUY" or "SELL" — determines execution path and page copy
+      mint: tokenMint,
+      label,
+      used: false,
+      expiresAt: Date.now() + PENDING_TRADE_TTL_MS,
+    });
+    const base = process.env.PUBLIC_BASE_URL || "";
+    confirmUrl = base ? `${base}/confirm/${id}` : `/confirm/${id}`;
+  }
+
   const color = action === "BUY" ? 0x2ecc71 : action === "SELL" ? 0xe74c3c : 0x95a5a6;
 
   // Only risk-check on BUYs — that's the moment you'd actually consider following in
@@ -288,6 +352,11 @@ async function handleTransaction(tx) {
       `[View Transaction](${solscanTx})`,
       solscanToken ? `[Solscan Token](${solscanToken})` : null,
       axiomLink ? `[Open on Axiom](${axiomLink})` : null,
+      confirmUrl
+        ? action === "BUY"
+          ? `[**Confirm Buy (${TRADE_AMOUNT_SOL} SOL)**](${confirmUrl})`
+          : `[**Confirm Sell (entire position)**](${confirmUrl})`
+        : null,
     ]
       .filter(Boolean)
       .join(" • "),
@@ -308,6 +377,258 @@ async function postToDiscord(payload) {
     console.error("Discord post failed:", res.status, text);
   }
 }
+
+const SOL_MINT = "So11111111111111111111111111111111111111112";
+
+// Get a live swap quote from Jupiter's public aggregator API. No API key needed.
+async function getJupiterQuote(outputMint, amountLamports) {
+  const url = `https://quote-api.jup.ag/v6/quote?inputMint=${SOL_MINT}&outputMint=${outputMint}&amount=${amountLamports}&slippageBps=500`;
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`Jupiter quote failed: ${res.status}`);
+  return res.json();
+}
+
+// Build, sign, and send the actual swap transaction.
+async function executeJupiterSwap(outputMint, amountSol) {
+  if (!tradingKeypair) throw new Error("No valid trading wallet configured");
+
+  const amountLamports = Math.round(amountSol * 1_000_000_000);
+  const quote = await getJupiterQuote(outputMint, amountLamports);
+
+  const swapRes = await fetch("https://quote-api.jup.ag/v6/swap", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      quoteResponse: quote,
+      userPublicKey: tradingKeypair.publicKey.toBase58(),
+      wrapAndUnwrapSol: true,
+      prioritizationFeeLamports: "auto",
+    }),
+  });
+  if (!swapRes.ok) throw new Error(`Jupiter swap build failed: ${swapRes.status}`);
+  const { swapTransaction } = await swapRes.json();
+
+  const txBuf = Buffer.from(swapTransaction, "base64");
+  const tx = VersionedTransaction.deserialize(txBuf);
+  tx.sign([tradingKeypair]);
+
+  const signature = await connection.sendRawTransaction(tx.serialize(), {
+    skipPreflight: false,
+    maxRetries: 3,
+  });
+  await connection.confirmTransaction(signature, "confirmed");
+  return signature;
+}
+
+// Check how much of a token the trading wallet actually holds right now.
+// Used for sells, since (unlike buys) the amount to sell isn't a fixed
+// setting — it's whatever position the wallet currently has.
+async function getTokenBalance(mint) {
+  if (!tradingKeypair) return null;
+  try {
+    const accounts = await connection.getParsedTokenAccountsByOwner(tradingKeypair.publicKey, {
+      mint: new PublicKey(mint),
+    });
+    if (accounts.value.length === 0) return { rawAmount: 0, uiAmount: 0, decimals: 0 };
+    const info = accounts.value[0].account.data.parsed.info.tokenAmount;
+    return {
+      rawAmount: info.amount, // string, smallest units — what Jupiter wants
+      uiAmount: info.uiAmount || 0,
+      decimals: info.decimals,
+    };
+  } catch (err) {
+    return null;
+  }
+}
+
+// Sell the trading wallet's entire balance of a token back to SOL.
+async function executeJupiterSell(mint) {
+  if (!tradingKeypair) throw new Error("No valid trading wallet configured");
+
+  const balance = await getTokenBalance(mint);
+  if (!balance || balance.rawAmount === "0" || balance.rawAmount === 0) {
+    throw new Error("No position found — trading wallet holds none of this token");
+  }
+
+  const quoteUrl = `https://quote-api.jup.ag/v6/quote?inputMint=${mint}&outputMint=${SOL_MINT}&amount=${balance.rawAmount}&slippageBps=500`;
+  const quoteRes = await fetch(quoteUrl);
+  if (!quoteRes.ok) throw new Error(`Jupiter quote failed: ${quoteRes.status}`);
+  const quote = await quoteRes.json();
+
+  const swapRes = await fetch("https://quote-api.jup.ag/v6/swap", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      quoteResponse: quote,
+      userPublicKey: tradingKeypair.publicKey.toBase58(),
+      wrapAndUnwrapSol: true,
+      prioritizationFeeLamports: "auto",
+    }),
+  });
+  if (!swapRes.ok) throw new Error(`Jupiter swap build failed: ${swapRes.status}`);
+  const { swapTransaction } = await swapRes.json();
+
+  const txBuf = Buffer.from(swapTransaction, "base64");
+  const tx = VersionedTransaction.deserialize(txBuf);
+  tx.sign([tradingKeypair]);
+
+  const signature = await connection.sendRawTransaction(tx.serialize(), {
+    skipPreflight: false,
+    maxRetries: 3,
+  });
+  await connection.confirmTransaction(signature, "confirmed");
+  return { signature, uiAmount: balance.uiAmount };
+}
+
+// Simple HTML confirmation page — no framework needed for one button.
+function renderConfirmPage(trade, opts = {}) {
+  const { error, disabled, disabledReason, sellBalance } = opts;
+  const isSell = trade.type === "SELL";
+  const heading = isSell ? `Confirm Sell: ${trade.label}` : `Confirm Buy: ${trade.label}`;
+  const amountLine = isSell
+    ? sellBalance
+      ? `Amount: <strong>${sellBalance.uiAmount} tokens (your entire tracked position)</strong>`
+      : `Amount: <strong>checking live balance...</strong>`
+    : `Amount: <strong>${TRADE_AMOUNT_SOL} SOL</strong>`;
+  const buttonLabel = isSell ? "Confirm Sell" : "Confirm Buy";
+
+  return `<!DOCTYPE html>
+<html><head><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Confirm Trade</title>
+<style>
+  body { font-family: -apple-system, sans-serif; background: #1a1a1a; color: #eee; display: flex; align-items: center; justify-content: center; min-height: 100vh; margin: 0; padding: 20px; box-sizing: border-box; }
+  .card { background: #2a2a2a; border-radius: 12px; padding: 24px; max-width: 420px; width: 100%; }
+  h2 { margin-top: 0; }
+  .mint { font-family: monospace; font-size: 12px; word-break: break-all; background: #1a1a1a; padding: 8px; border-radius: 6px; }
+  button { width: 100%; padding: 14px; font-size: 16px; border-radius: 8px; border: none; margin-top: 16px; cursor: pointer; }
+  .confirm { background: ${isSell ? "#e74c3c" : "#2ecc71"}; color: #000; font-weight: bold; }
+  .confirm:disabled { background: #555; color: #999; cursor: not-allowed; }
+  .error { color: #e74c3c; margin-top: 12px; }
+  .info { color: #999; font-size: 13px; margin-top: 12px; }
+</style></head>
+<body>
+  <div class="card">
+    <h2>${heading}</h2>
+    <p>${amountLine}</p>
+    <p class="mint">${trade.mint}</p>
+    ${error ? `<p class="error">${error}</p>` : ""}
+    ${disabled ? `<p class="error">${disabledReason}</p>` : ""}
+    <form method="POST" action="/confirm/${trade.id}/execute">
+      <button class="confirm" type="submit" ${disabled ? "disabled" : ""}>${buttonLabel}</button>
+    </form>
+    <p class="info">This link expires 15 minutes from when the alert fired. ${isSell ? "The exact amount is checked live from your trading wallet's actual balance when you load this page." : "Price is quoted live at the moment you click confirm, not when the alert was sent."}</p>
+  </div>
+</body></html>`;
+}
+
+app.get("/confirm/:id", async (req, res) => {
+  const trade = pendingTrades.get(req.params.id);
+  if (!trade) return res.status(404).send(renderConfirmPage(
+    { id: req.params.id, label: "Unknown", mint: "" },
+    { disabled: true, disabledReason: "This trade link is invalid or has already been used." }
+  ));
+
+  if (trade.used) {
+    return res.send(renderConfirmPage(trade, { disabled: true, disabledReason: "Already executed." }));
+  }
+  if (Date.now() > trade.expiresAt) {
+    return res.send(renderConfirmPage(trade, { disabled: true, disabledReason: "This link has expired." }));
+  }
+  if (!TRADING_ENABLED) {
+    return res.send(renderConfirmPage(trade, { disabled: true, disabledReason: "Trading is currently disabled (TRADING_ENABLED=false)." }));
+  }
+  if (!tradingKeypair) {
+    return res.send(renderConfirmPage(trade, { disabled: true, disabledReason: "No valid trading wallet configured." }));
+  }
+
+  if (trade.type === "SELL") {
+    const balance = await getTokenBalance(trade.mint);
+    if (!balance || balance.uiAmount === 0) {
+      return res.send(renderConfirmPage(trade, {
+        disabled: true,
+        disabledReason: "Trading wallet holds none of this token — nothing to sell.",
+      }));
+    }
+    return res.send(renderConfirmPage(trade, { sellBalance: balance }));
+  }
+
+  // BUY-only: daily spend cap check
+  checkAndResetDaily();
+  if (dailySpentSol + TRADE_AMOUNT_SOL > MAX_DAILY_SOL) {
+    return res.send(renderConfirmPage(trade, {
+      disabled: true,
+      disabledReason: `Daily spend cap reached (${dailySpentSol.toFixed(3)}/${MAX_DAILY_SOL} SOL). Resets at midnight UTC.`,
+    }));
+  }
+
+  res.send(renderConfirmPage(trade));
+});
+
+app.post("/confirm/:id/execute", async (req, res) => {
+  const trade = pendingTrades.get(req.params.id);
+  if (!trade) return res.status(404).send("Trade not found or expired.");
+  if (trade.used) return res.send(renderConfirmPage(trade, { disabled: true, disabledReason: "Already executed." }));
+  if (Date.now() > trade.expiresAt) return res.send(renderConfirmPage(trade, { disabled: true, disabledReason: "Link expired." }));
+  if (!TRADING_ENABLED || !tradingKeypair) {
+    return res.send(renderConfirmPage(trade, { disabled: true, disabledReason: "Trading is disabled or misconfigured." }));
+  }
+
+  if (trade.type === "SELL") {
+    trade.used = true;
+    try {
+      const { signature, uiAmount } = await executeJupiterSell(trade.mint);
+      await postToDiscord({
+        embeds: [{
+          title: `✅ Sold: ${trade.label}`,
+          color: 0xe74c3c,
+          description: `[View Transaction](https://solscan.io/tx/${signature})`,
+          fields: [{ name: "Amount Sold", value: `${uiAmount} tokens`, inline: true }],
+          timestamp: new Date().toISOString(),
+        }],
+      });
+      return res.send(`<html><body style="font-family:sans-serif;background:#1a1a1a;color:#eee;padding:40px;text-align:center;">
+        <h2>✅ Position sold</h2>
+        <p><a href="https://solscan.io/tx/${signature}" style="color:#e74c3c;">View on Solscan</a></p>
+      </body></html>`);
+    } catch (err) {
+      console.error("Sell execution failed:", err.message);
+      trade.used = false;
+      return res.send(renderConfirmPage(trade, { error: `Execution failed: ${err.message}. You can try again.` }));
+    }
+  }
+
+  // BUY path
+  checkAndResetDaily();
+  if (dailySpentSol + TRADE_AMOUNT_SOL > MAX_DAILY_SOL) {
+    return res.send(renderConfirmPage(trade, { disabled: true, disabledReason: "Daily spend cap reached." }));
+  }
+
+  trade.used = true; // mark used before executing so a double-click can't fire twice
+
+  try {
+    const signature = await executeJupiterSwap(trade.mint, TRADE_AMOUNT_SOL);
+    dailySpentSol += TRADE_AMOUNT_SOL;
+
+    await postToDiscord({
+      embeds: [{
+        title: `✅ Executed: ${trade.label}`,
+        color: 0x2ecc71,
+        description: `[View Transaction](https://solscan.io/tx/${signature})`,
+        fields: [{ name: "Amount", value: `${TRADE_AMOUNT_SOL} SOL`, inline: true }],
+        timestamp: new Date().toISOString(),
+      }],
+    });
+
+    res.send(`<html><body style="font-family:sans-serif;background:#1a1a1a;color:#eee;padding:40px;text-align:center;">
+      <h2>✅ Trade executed</h2>
+      <p><a href="https://solscan.io/tx/${signature}" style="color:#2ecc71;">View on Solscan</a></p>
+    </body></html>`);
+  } catch (err) {
+    console.error("Trade execution failed:", err.message);
+    trade.used = false; // allow retry since it didn't actually go through
+    res.send(renderConfirmPage(trade, { error: `Execution failed: ${err.message}. You can try again.` }));
+  }
+});
 
 app.listen(PORT, () => {
   console.log(`Wallet alert bot listening on port ${PORT}`);
