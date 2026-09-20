@@ -46,6 +46,78 @@ if (TRADING_WALLET_PRIVATE_KEY) {
   }
 }
 
+// ===== Jupiter endpoint (configurable) =====
+// Default keeps the original endpoint. If quotes start failing, set JUP_BASE in Railway
+// (e.g. https://lite-api.jup.ag/swap/v1) and, if Jupiter requires one, JUP_API_KEY.
+const JUP_BASE = (process.env.JUP_BASE || "https://quote-api.jup.ag/v6").replace(/\/+$/, "");
+const JUP_API_KEY = process.env.JUP_API_KEY || "";
+const jupAuthHeaders = () => (JUP_API_KEY ? { "x-api-key": JUP_API_KEY } : {});
+
+// A "confirmed" transaction can still have FAILED on-chain (e.g. slippage exceeded).
+// confirmTransaction returns the error instead of throwing, so check it explicitly.
+async function confirmOrThrow(signature) {
+  const conf = await connection.confirmTransaction(signature, "confirmed");
+  if (conf && conf.value && conf.value.err) {
+    throw new Error("Transaction failed on-chain: " + JSON.stringify(conf.value.err));
+  }
+}
+
+// ===== Copy-trade agent (paper by default — see AGENT.md) =====
+const AGENT_ENABLED = (process.env.AGENT_ENABLED || "false").toLowerCase() === "true";
+const ADMIN_TOKEN = process.env.ADMIN_TOKEN || "";
+const { makeAdminCheck } = require("./agent/admin");
+const isAdmin = makeAdminCheck(ADMIN_TOKEN);
+let agent = null;
+let agentStartupNote = null;
+if (AGENT_ENABLED) {
+  if (!HELIUS_WEBHOOK_SECRET || ADMIN_TOKEN.length < 24) {
+    // With auto-execution, an unauthenticated webhook lets anyone forge a "trader bought X" event.
+    agentStartupNote = "Agent NOT started: set HELIUS_WEBHOOK_SECRET and an ADMIN_TOKEN of at least 24 random characters in Railway (and the same secret as the Auth Header on the Helius webhook).";
+    console.error(agentStartupNote);
+  } else {
+    try {
+      const { createAgent } = require("./agent");
+      const { createChain } = require("./agent/chain");
+      const { createState } = require("./agent/state");
+      const { loadAgentConfig } = require("./agent/config");
+      const { fetchRugCheck } = require("./agent/rugcheck");
+      const num = (v, d) => { const n = parseFloat(v); return Number.isFinite(n) ? n : d; };
+      const agentCfg = loadAgentConfig(path.join(__dirname, "agent-config.json"));
+      const agentEnv = {
+        agentLive: (process.env.AGENT_LIVE || "false").toLowerCase() === "true",
+        tradingEnabled: TRADING_ENABLED,
+        budgetSol: num(process.env.AGENT_BUDGET_SOL, 0.27), // total SOL the agent may have open
+        maxPositions: Math.floor(num(process.env.AGENT_MAX_POSITIONS, 3)),
+        dailyLossSol: num(process.env.AGENT_DAILY_LOSS_SOL, 0.09), // pauses new live buys
+        solReserve: num(process.env.AGENT_SOL_RESERVE, 0.03), // SOL always left for fees/rent
+        slippageBps: num(process.env.AGENT_SLIPPAGE_BPS, 500),
+        paperFeeSol: num(process.env.AGENT_PAPER_FEE_SOL, 0.0003), // fee assumed per paper trade side
+      };
+      const agentChain = createChain({
+        connection,
+        keypair: tradingKeypair,
+        base: JUP_BASE,
+        apiKey: JUP_API_KEY,
+        priorityFeeLamports: Math.floor(num(process.env.AGENT_PRIORITY_FEE_LAMPORTS, 200000)),
+      });
+      const agentState = createState({ dir: process.env.DATA_DIR || path.join(__dirname, "data") });
+      agent = createAgent({
+        cfg: agentCfg,
+        env: agentEnv,
+        chain: agentChain,
+        rugcheck: fetchRugCheck,
+        post: (p) => postToDiscord(p).catch((e) => console.error("Discord post error:", e.message)),
+        state: agentState,
+      });
+      agent.registerRoutes(app, isAdmin);
+      process.on("SIGTERM", () => { agentState.flush(); process.exit(0); });
+    } catch (err) {
+      agentStartupNote = `Agent NOT started: ${err.message}`;
+      console.error(agentStartupNote);
+    }
+  }
+}
+
 // Pending trades awaiting your confirmation click. In-memory only — if the
 // server restarts, unconfirmed links go dead (safer than surviving a restart
 // with stale state).
@@ -85,6 +157,7 @@ let trackedWallets = loadWallets();
 
 // Reload wallets.json without restarting the server (handy since you'll edit this file often)
 app.post("/reload-wallets", (req, res) => {
+  if (ADMIN_TOKEN && !isAdmin(req)) return res.status(401).json({ error: "unauthorized" });
   trackedWallets = loadWallets();
   res.json({ ok: true, count: trackedWallets.size });
 });
@@ -237,6 +310,11 @@ app.post("/helius-webhook", async (req, res) => {
   const events = Array.isArray(req.body) ? req.body : [req.body];
   res.status(200).json({ received: true }); // ack immediately, process after
 
+  // Agent gets its own concurrent path so slow alert enrichment (RugCheck etc.) never delays it.
+  if (agent) {
+    Promise.allSettled(events.map((tx) => agent.handleWebhookTx(tx))).catch(() => {});
+  }
+
   for (const tx of events) {
     try {
       await handleTransaction(tx);
@@ -382,8 +460,8 @@ const SOL_MINT = "So11111111111111111111111111111111111111112";
 
 // Get a live swap quote from Jupiter's public aggregator API. No API key needed.
 async function getJupiterQuote(outputMint, amountLamports) {
-  const url = `https://quote-api.jup.ag/v6/quote?inputMint=${SOL_MINT}&outputMint=${outputMint}&amount=${amountLamports}&slippageBps=500`;
-  const res = await fetch(url);
+  const url = `${JUP_BASE}/quote?inputMint=${SOL_MINT}&outputMint=${outputMint}&amount=${amountLamports}&slippageBps=500`;
+  const res = await fetch(url, { headers: jupAuthHeaders() });
   if (!res.ok) throw new Error(`Jupiter quote failed: ${res.status}`);
   return res.json();
 }
@@ -395,9 +473,9 @@ async function executeJupiterSwap(outputMint, amountSol) {
   const amountLamports = Math.round(amountSol * 1_000_000_000);
   const quote = await getJupiterQuote(outputMint, amountLamports);
 
-  const swapRes = await fetch("https://quote-api.jup.ag/v6/swap", {
+  const swapRes = await fetch(`${JUP_BASE}/swap`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", ...jupAuthHeaders() },
     body: JSON.stringify({
       quoteResponse: quote,
       userPublicKey: tradingKeypair.publicKey.toBase58(),
@@ -416,7 +494,7 @@ async function executeJupiterSwap(outputMint, amountSol) {
     skipPreflight: false,
     maxRetries: 3,
   });
-  await connection.confirmTransaction(signature, "confirmed");
+  await confirmOrThrow(signature);
   return signature;
 }
 
@@ -450,14 +528,14 @@ async function executeJupiterSell(mint) {
     throw new Error("No position found — trading wallet holds none of this token");
   }
 
-  const quoteUrl = `https://quote-api.jup.ag/v6/quote?inputMint=${mint}&outputMint=${SOL_MINT}&amount=${balance.rawAmount}&slippageBps=500`;
-  const quoteRes = await fetch(quoteUrl);
+  const quoteUrl = `${JUP_BASE}/quote?inputMint=${mint}&outputMint=${SOL_MINT}&amount=${balance.rawAmount}&slippageBps=500`;
+  const quoteRes = await fetch(quoteUrl, { headers: jupAuthHeaders() });
   if (!quoteRes.ok) throw new Error(`Jupiter quote failed: ${quoteRes.status}`);
   const quote = await quoteRes.json();
 
-  const swapRes = await fetch("https://quote-api.jup.ag/v6/swap", {
+  const swapRes = await fetch(`${JUP_BASE}/swap`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", ...jupAuthHeaders() },
     body: JSON.stringify({
       quoteResponse: quote,
       userPublicKey: tradingKeypair.publicKey.toBase58(),
@@ -476,7 +554,7 @@ async function executeJupiterSell(mint) {
     skipPreflight: false,
     maxRetries: 3,
   });
-  await connection.confirmTransaction(signature, "confirmed");
+  await confirmOrThrow(signature);
   return { signature, uiAmount: balance.uiAmount };
 }
 
@@ -633,4 +711,10 @@ app.post("/confirm/:id/execute", async (req, res) => {
 app.listen(PORT, () => {
   console.log(`Wallet alert bot listening on port ${PORT}`);
   console.log(`Tracking ${trackedWallets.size} wallet(s).`);
+  if (agent) {
+    agent.startTimers();
+    agent.startupReport().catch((e) => console.error("Agent startup report failed:", e.message));
+  } else if (agentStartupNote) {
+    postToDiscord({ content: `⚠️ ${agentStartupNote}` }).catch(() => {});
+  }
 });
