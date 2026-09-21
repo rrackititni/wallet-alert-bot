@@ -1,0 +1,21 @@
+{
+  "defaults": {
+    "mode": "paper",
+    "sizeSol": 0.05,
+    "minBuyUsd": 100,
+    "maxPriceImpactPct": 3,
+    "maxRugScore": 60,
+    "skipOwnTokens": true,
+    "mirrorAddOns": false,
+    "mirrorSells": true,
+    "maxLagSec": 30,
+    "slippageBps": 500,
+    "minSellFraction": 0.1
+  },
+  "wallets": [
+    { "address": "BCagckXeMChUKrHEd6fKFA1uiWDtcmCXMsqaheLiUPJd", "label": "dvces", "mode": "live" },
+    { "address": "4vw54BmAogeRV3vPKWyFet5yf8DTLcREzdSzx4rw9Ud9", "label": "Decu" },
+    { "address": "ardinRsN1mNYVeoJWTBsWeYeXvuR9UUDGMsCDKpb6AT", "label": "trunoest" },
+    { "address": "suqh5sHtr8HyJ7q8scBimULPkPpA557prMG47xCHQfK", "label": "cupsey" }
+  ]
+}
