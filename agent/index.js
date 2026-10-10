@@ -85,6 +85,25 @@ function createAgent({ cfg, env, chain, rugcheck, post, state, now = Date.now, l
   const embed = (title, color, fields = [], description) =>
     post({ embeds: [{ title, color, description, fields, timestamp: new Date(now()).toISOString() }] });
 
+  // In-memory feed of recent executed actions (buys/sells, paper and live) for the dashboard.
+  // Deliberately NOT persisted and NOT a source of truth for anything — just the last 100
+  // things that happened, newest first, so a live view has something to show. Never read this
+  // for cumulative stats (that's the capped-array bug from before).
+  const activity = [];
+  const logEvent = (ev) => {
+    activity.unshift({ ts: now(), ...ev });
+    if (activity.length > 100) activity.length = 100;
+  };
+  function openPositionsSnapshot() {
+    const rows = [];
+    for (const p of Object.values(S.paper.positions))
+      rows.push({ mode: "paper", wallet: p.wallet, mint: p.mint, costSol: +p.costSol.toFixed(4), openedAt: p.openedAt, theirUsd: p.theirUsd || null });
+    for (const p of Object.values(S.live.positions))
+      rows.push({ mode: "live", wallet: p.wallet, mint: p.mint, costSol: +p.costSol.toFixed(4), openedAt: p.openedAt });
+    rows.sort((a, b) => b.openedAt - a.openedAt);
+    return rows.slice(0, 60);
+  }
+
   function rollDaily() {
     if (S.daily.date !== today()) S.daily = { date: today(), realizedSol: 0, lossAlerted: false };
   }
@@ -184,6 +203,7 @@ function createAgent({ cfg, env, chain, rugcheck, post, state, now = Date.now, l
     }
     if (S.sellAccum) delete S.sellAccum[key];
     state.bump(w.label, "paperBuys");
+    logEvent({ type: "paper-buy", wallet: w.label, mint: sig.mint, sizeSol: w.sizeSol, theirUsd: Math.round(pc.baseUsd) });
     state.save();
 
     // ----- live (optional) -----
@@ -240,6 +260,7 @@ function createAgent({ cfg, env, chain, rugcheck, post, state, now = Date.now, l
       rawHeld: gotRaw.toString(), sig: signature,
     };
     state.bump(w.label, "liveBuys");
+    logEvent({ type: "live-buy", wallet: w.label, mint: sig.mint, sizeSol: w.sizeSol });
     state.save();
     await embed(`🟢 LIVE BUY (mirroring ${w.label})`, 0x2ecc71, [
       { name: "Token", value: `\`${sig.mint}\``, inline: false },
@@ -329,6 +350,7 @@ function createAgent({ cfg, env, chain, rugcheck, post, state, now = Date.now, l
     state.bump(w.label, "paperExits");
     if (pnl > 0) state.bump(w.label, "paperWins");
     state.bump(w.label, "paperSells");
+    logEvent({ type: "paper-sell", wallet: w.label, mint: pos.mint, pnlSol: +pnl.toFixed(4), pct: Math.round(frac * 100) });
     state.save();
   }
 
@@ -386,6 +408,7 @@ function createAgent({ cfg, env, chain, rugcheck, post, state, now = Date.now, l
     }
     if (S.live.closed.length > 1000) S.live.closed.splice(0, S.live.closed.length - 1000);
     state.bump(w.label, "liveSells");
+    logEvent({ type: "live-sell", wallet: pos.wallet, mint: pos.mint, pnlSol: +pnl.toFixed(4), pct: Math.round(frac * 100) });
     state.save();
     await embed(`🔴 LIVE SELL (${why === "panic" ? "panic" : "mirroring"} ${pos.wallet})`, 0xe74c3c, [
       { name: "Token", value: `\`${pos.mint}\``, inline: false },
@@ -540,6 +563,13 @@ function createAgent({ cfg, env, chain, rugcheck, post, state, now = Date.now, l
         if (String((req.body || {}).confirm) !== "yes") return { error: "Tick the confirm box to sell ALL live positions." };
         return { results: await panic() };
       },
+      activity: async () => ({
+        paused: S.paused,
+        liveArmed: liveEnabled(),
+        wallets: cfg.wallets.map((w) => ({ label: w.label, mode: w.mode })),
+        events: activity.slice(0, 50),
+        open: openPositionsSnapshot(),
+      }),
     };
 
     // JSON API. Token goes in the x-admin-token header (never the URL: URLs end up in logs and history).
@@ -554,6 +584,13 @@ function createAgent({ cfg, env, chain, rugcheck, post, state, now = Date.now, l
     };
     app.get("/agent/status", guard(actions.status));
     for (const name of ["summary", "pause", "resume", "panic"]) app.post(`/agent/${name}`, guard(actions[name]));
+
+    // /agent/activity is read by the Rackitini City dashboard artifact, running on a different
+    // origin, so (unlike the other routes above) it needs CORS. Still token-gated — the wildcard
+    // origin only matters once the request already carries a valid x-admin-token header.
+    const activityCors = { "Access-Control-Allow-Origin": "*", "Access-Control-Allow-Headers": "x-admin-token, Content-Type", "Access-Control-Allow-Methods": "GET, OPTIONS" };
+    app.options("/agent/activity", (req, res) => res.set(activityCors).sendStatus(204));
+    app.get("/agent/activity", (req, res, next) => { res.set(activityCors); next(); }, guard(actions.activity));
 
     // Phone-friendly page: type the token, tap a button. Token travels in the POST body only.
     const page = (body) => `<!DOCTYPE html><html><head><meta name="viewport" content="width=device-width, initial-scale=1">
