@@ -19,6 +19,42 @@ function createAgent({ cfg, env, chain, rugcheck, post, state, now = Date.now, l
   const byLabel = new Map(cfg.wallets.map((w) => [w.label, w]));
   const seen = new Set();
 
+  // One-time migration: the daily summary used to derive realized SOL / exit count / win
+  // count / "fill vs trader" / "detect lag" by filtering S.paper.closed, an array capped at
+  // 3000 entries SHARED across every wallet. Once total volume crossed that cap, old entries
+  // silently evicted and those numbers became a rolling window instead of true running totals.
+  // This seeds unbounded per-wallet counters (data.stats[label], same place signals/buySignals
+  // already live) from whatever still happens to be in the capped arrays right now, so wallets
+  // with history don't show 0 after this fix deploys. It's a best-effort baseline, not a
+  // recovery of data already evicted before this ran — that's gone. Guarded by `_backfilled`
+  // so it only ever runs once per wallet, even across restarts.
+  (function backfillClosedStats() {
+    let changed = false;
+    for (const w of cfg.wallets) {
+      const st = state.stat(w.label);
+      if (st._backfilled) continue;
+      const partials = S.paper.closed.filter((c) => c.wallet === w.label && c.partial);
+      st.paperRealizedSol = (st.paperRealizedSol || 0) + partials.reduce((s, c) => s + c.pnlSol, 0);
+      st.paperExits = (st.paperExits || 0) + partials.length;
+      st.paperWins = (st.paperWins || 0) + partials.filter((c) => c.pnlSol > 0).length;
+      const open = Object.values(S.paper.positions).filter((p) => p.wallet === w.label);
+      const closedFull = S.paper.closed.filter((c) => c.wallet === w.label && !c.partial);
+      for (const p of [...open, ...closedFull]) {
+        if (typeof p.slipVsThemPct === "number") {
+          st.slipSumPct = (st.slipSumPct || 0) + p.slipVsThemPct;
+          st.slipCount = (st.slipCount || 0) + 1;
+        }
+        if (typeof p.lagSec === "number") {
+          st.lagSumSec = (st.lagSumSec || 0) + p.lagSec;
+          st.lagCount = (st.lagCount || 0) + 1;
+        }
+      }
+      st._backfilled = true;
+      changed = true;
+    }
+    if (changed) state.save();
+  })();
+
   // Serializes everything that spends or sells real money so concurrent webhooks
   // can't both pass the same cap check.
   let lockChain = Promise.resolve();
@@ -130,12 +166,21 @@ function createAgent({ cfg, env, chain, rugcheck, post, state, now = Date.now, l
       existing.feeSol += env.paperFeeSol;
       existing.rawHeld = (BigInt(existing.rawHeld) + BigInt(q.outAmount)).toString();
     } else {
+      const lagRounded = Math.round(lagSec * 10) / 10;
       S.paper.positions[key] = {
         key, wallet: w.label, mint: sig.mint, openedAt: now(),
         costSol: w.sizeSol, feeSol: env.paperFeeSol, rawHeld: String(q.outAmount), decimals,
-        theirUsd: Math.round(pc.baseUsd), slipVsThemPct: slip, lagSec: Math.round(lagSec * 10) / 10,
+        theirUsd: Math.round(pc.baseUsd), slipVsThemPct: slip, lagSec: lagRounded,
         priceImpactPct: +impact.toFixed(2), rugScore: rc.score, sig: sig.signature,
       };
+      // Running totals for the "fill vs trader" / "detect lag" averages in the daily summary —
+      // tracked here (unbounded) instead of re-derived from the capped positions/closed arrays.
+      if (slip != null) {
+        state.bump(w.label, "slipSumPct", slip);
+        state.bump(w.label, "slipCount");
+      }
+      state.bump(w.label, "lagSumSec", lagRounded);
+      state.bump(w.label, "lagCount");
     }
     if (S.sellAccum) delete S.sellAccum[key];
     state.bump(w.label, "paperBuys");
@@ -278,6 +323,11 @@ function createAgent({ cfg, env, chain, rugcheck, post, state, now = Date.now, l
     }
     S.paper.closed.push({ key, wallet: w.label, mint: pos.mint, closedAt: now(), partial: true, pnlSol: pnl, unsellable });
     if (S.paper.closed.length > 3000) S.paper.closed.splice(0, S.paper.closed.length - 3000);
+    // Running totals for the daily summary — this array is a capped debug log, not the source
+    // of truth, so realized SOL / exit count / win count must never be re-derived from it.
+    state.bump(w.label, "paperRealizedSol", pnl);
+    state.bump(w.label, "paperExits");
+    if (pnl > 0) state.bump(w.label, "paperWins");
     state.bump(w.label, "paperSells");
     state.save();
   }
@@ -401,9 +451,14 @@ function createAgent({ cfg, env, chain, rugcheck, post, state, now = Date.now, l
     let marked = 0;
     for (const w of cfg.wallets) {
       const st = S.stats[w.label] || { skipped: {} };
-      const closed = S.paper.closed.filter((c) => c.wallet === w.label && c.partial);
-      const realized = closed.reduce((s, c) => s + c.pnlSol, 0);
-      const wins = closed.filter((c) => c.pnlSol > 0).length;
+      // realized / exits / wins / avg slip / avg lag are running totals (see backfillClosedStats
+      // and the bumps in processBuy/paperExit) — NOT derived from S.paper.closed, which is a
+      // capped debug log that silently evicts old entries once total volume crosses 3000.
+      const realized = st.paperRealizedSol || 0;
+      const exits = st.paperExits || 0;
+      const wins = st.paperWins || 0;
+      const avgSlip = st.slipCount ? st.slipSumPct / st.slipCount : null;
+      const avgLag = st.lagCount ? st.lagSumSec / st.lagCount : null;
       const open = Object.values(S.paper.positions).filter((p) => p.wallet === w.label);
       let unrealized = 0;
       let unmarkable = 0;
@@ -418,10 +473,6 @@ function createAgent({ cfg, env, chain, rugcheck, post, state, now = Date.now, l
           unrealized -= p.costSol + p.feeSol;
         }
       }
-      const all = [...open, ...S.paper.closed.filter((c) => c.wallet === w.label && !c.partial)];
-      const slips = all.map((p) => p.slipVsThemPct).filter((v) => typeof v === "number");
-      const lags = all.map((p) => p.lagSec).filter((v) => typeof v === "number");
-      const avg = (a) => (a.length ? a.reduce((x, y) => x + y, 0) / a.length : null);
       const topSkips = Object.entries(st.skipped || {}).sort((a, b) => b[1] - a[1]).slice(0, 4)
         .map(([k, v]) => `${k} ${v}`).join(", ") || "none";
       const liveOpen = Object.values(S.live.positions).filter((p) => p.wallet === w.label).length;
@@ -429,8 +480,8 @@ function createAgent({ cfg, env, chain, rugcheck, post, state, now = Date.now, l
         name: `${w.label} (${w.mode})`,
         value: [
           `Signals ${st.signals || 0} · buys ${st.buySignals || 0} · paper entries ${st.paperBuys || 0}`,
-          `Paper: ${open.length} open, ${closed.length} exits (${wins} wins) · realized ${fmt(realized)} SOL · unrealized ${fmt(unrealized)} SOL${unmarkable ? ` (${unmarkable} unsellable)` : ""}`,
-          `Fill vs trader: ${avg(slips) == null ? "n/a" : fmt(avg(slips), 1) + "%"} avg · detect lag ${avg(lags) == null ? "n/a" : avg(lags).toFixed(1) + "s"}`,
+          `Paper: ${open.length} open, ${exits} exits (${wins} wins) · realized ${fmt(realized)} SOL · unrealized ${fmt(unrealized)} SOL${unmarkable ? ` (${unmarkable} unsellable)` : ""}`,
+          `Fill vs trader: ${avgSlip == null ? "n/a" : fmt(avgSlip, 1) + "%"} avg · detect lag ${avgLag == null ? "n/a" : avgLag.toFixed(1) + "s"}`,
           `Top skips: ${topSkips}`,
           w.mode === "live" ? `Live: ${liveOpen} open · ${st.liveBuys || 0} buys · ${st.liveSells || 0} sells` : null,
         ].filter(Boolean).join("\n").slice(0, 1000),
